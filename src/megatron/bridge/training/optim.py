@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from typing import Optional, Union
+
+import torch
 
 from megatron.core.optimizer import (
     MegatronOptimizer,
@@ -29,6 +33,9 @@ from megatron.bridge.training.config import (
     OptimizerConfigOverrideProviderContext,
     SchedulerConfig,
 )
+
+
+_LOG = logging.getLogger(__name__)
 
 
 def setup_optimizer(
@@ -79,7 +86,80 @@ def setup_optimizer(
 
     scheduler = _get_scheduler(optimizer_config, scheduler_config, optimizer)
 
+    optimizer = _maybe_wrap_with_cautious_wd(optimizer, optimizer_config)
+
     return optimizer, scheduler
+
+
+def _maybe_wrap_with_cautious_wd(
+    optimizer: MegatronOptimizer, optimizer_config: OptimizerConfig
+) -> MegatronOptimizer:
+    """Wrap ``optimizer.step()`` with Cautious Weight Decay (modded-nanogpt PR #154).
+
+    Activated by setting the ``BUCKET_A_CAUTIOUS_WD`` environment variable to a
+    positive float. The factor is applied as ``p -= mask * lr * factor * p`` after
+    the optimizer's underlying step, where ``mask = (|p_new| > |p_old|)`` — i.e.
+    weight decay is applied only to parameters whose magnitude grew during the step.
+
+    The caller is expected to set ``optimizer_config.weight_decay = 0.0`` so the
+    underlying optimizer does not also apply standard WD; otherwise both compound.
+
+    The wrapped step also propagates the post-CWD master parameters back to the
+    bf16/fp16 model copies via ``_copy_main_params_to_model_params`` if available
+    on the optimizer (DistributedOptimizer / MixedPrecisionOptimizer).
+    """
+    factor_str = os.environ.get("BUCKET_A_CAUTIOUS_WD", "")
+    if not factor_str:
+        return optimizer
+    try:
+        factor = float(factor_str)
+    except ValueError:
+        _LOG.warning("BUCKET_A_CAUTIOUS_WD=%r is not a float; ignoring", factor_str)
+        return optimizer
+    if factor <= 0:
+        return optimizer
+
+    if getattr(optimizer_config, "weight_decay", 0.0) > 0:
+        _LOG.warning(
+            "BUCKET_A_CAUTIOUS_WD=%s with optimizer_config.weight_decay=%s (>0); "
+            "standard WD will compound with cautious WD. Set weight_decay=0 to "
+            "use cautious WD only.",
+            factor,
+            optimizer_config.weight_decay,
+        )
+
+    _LOG.info("Cautious Weight Decay wrapper enabled with factor=%s", factor)
+
+    original_step = optimizer.step
+    propagate_method = None
+    for name in ("_copy_main_params_to_model_params", "reload_model_params"):
+        if hasattr(optimizer, name):
+            propagate_method = name
+            break
+
+    def cautious_step(*args, **kwargs):
+        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.requires_grad and p.numel() > 0:
+                    snapshots.append((p, p.detach().abs().clone()))
+
+        result = original_step(*args, **kwargs)
+
+        lr = float(optimizer.param_groups[0].get("lr", 0.0))
+        coef = -lr * factor
+        if coef != 0.0:
+            with torch.no_grad():
+                for p, prev_abs in snapshots:
+                    mask = (p.detach().abs() > prev_abs).to(p.dtype)
+                    p.data.addcmul_(mask, p.data, value=coef)
+            if propagate_method is not None:
+                getattr(optimizer, propagate_method)()
+
+        return result
+
+    optimizer.step = cautious_step
+    return optimizer
 
 
 def _get_scheduler(
