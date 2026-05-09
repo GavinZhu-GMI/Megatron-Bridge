@@ -147,13 +147,56 @@ def _maybe_wrap_with_cautious_wd(
         step_idx = state["step"]
         log_this_step = debug_log_every > 0 and step_idx % debug_log_every == 0
 
+        # One-shot identity probe at step=1: confirm param_groups[*].params
+        # are the master fp32 tensors that the inner optimizer actually
+        # mutates in-place during step().
+        identity_probe = step_idx == 1 and os.environ.get("BUCKET_A_CAUTIOUS_WD_IDENTITY_PROBE", "1") != "0"
+        pre_fingerprints: list[tuple[int, int, float]] = []  # (id, data_ptr, sum)
+
         snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for group in optimizer.param_groups:
-            for p in group["params"]:
+        for group_i, group in enumerate(optimizer.param_groups):
+            if identity_probe:
+                _LOG.info(
+                    "[CWD-probe] group %d: %d params, lr=%s, wd=%s, keys=%s",
+                    group_i, len(group["params"]), group.get("lr"), group.get("weight_decay"),
+                    sorted(group.keys()),
+                )
+            for p_i, p in enumerate(group["params"]):
                 if p.requires_grad and p.numel() > 0:
                     snapshots.append((p, p.detach().abs().clone()))
+                    if identity_probe and p_i < 3:  # first few per group only, to limit log spam
+                        s = float(p.detach().sum().item())
+                        _LOG.info(
+                            "[CWD-probe] g%d.p%d id=%d ptr=0x%x dtype=%s shape=%s "
+                            "device=%s sum=%.6e",
+                            group_i, p_i, id(p), p.data_ptr(), p.dtype,
+                            tuple(p.shape), p.device, s,
+                        )
+                        pre_fingerprints.append((id(p), p.data_ptr(), s))
 
         result = original_step(*args, **kwargs)
+
+        if identity_probe and pre_fingerprints:
+            for group_i, group in enumerate(optimizer.param_groups):
+                for p_i, p in enumerate(group["params"]):
+                    if p_i >= 3:
+                        break
+                    if not (p.requires_grad and p.numel() > 0):
+                        continue
+                    new_s = float(p.detach().sum().item())
+                    # find the matching pre-fingerprint by id
+                    pre = next((f for f in pre_fingerprints if f[0] == id(p)), None)
+                    same_obj = pre is not None
+                    same_ptr = same_obj and pre[1] == p.data_ptr()
+                    s_changed = same_obj and abs(pre[2] - new_s) > 1e-12
+                    _LOG.info(
+                        "[CWD-probe] post-step g%d.p%d id=%d ptr=0x%x same_obj=%s "
+                        "same_ptr=%s sum_changed=%s pre_sum=%.6e post_sum=%.6e",
+                        group_i, p_i, id(p), p.data_ptr(), same_obj, same_ptr,
+                        s_changed,
+                        pre[2] if pre else float("nan"),
+                        new_s,
+                    )
 
         lr = float(optimizer.param_groups[0].get("lr", 0.0))
         coef = -lr * factor
