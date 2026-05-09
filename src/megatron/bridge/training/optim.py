@@ -132,6 +132,7 @@ def _maybe_wrap_with_cautious_wd(
 
     debug_log_every = int(os.environ.get("BUCKET_A_CAUTIOUS_WD_LOG_EVERY", "0"))
     apply_cwd = os.environ.get("BUCKET_A_CAUTIOUS_WD_APPLY", "1") != "0"
+    do_propagate = os.environ.get("BUCKET_A_CAUTIOUS_WD_PROPAGATE", "1") != "0"
 
     original_step = optimizer.step
     propagate_method = None
@@ -230,7 +231,7 @@ def _maybe_wrap_with_cautious_wd(
                         delta_l1 += float((mask * p.data).abs().sum().item()) * abs(coef)
                     p.data.addcmul_(mask, p.data, value=coef)
                 cwd_applied = True
-            if propagate_method is not None:
+            if do_propagate and propagate_method is not None:
                 getattr(optimizer, propagate_method)()
 
         if log_this_step:
