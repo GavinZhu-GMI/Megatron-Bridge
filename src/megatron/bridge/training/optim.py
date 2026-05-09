@@ -162,15 +162,20 @@ def _maybe_wrap_with_cautious_wd(
                     sorted(group.keys()),
                 )
             for p_i, p in enumerate(group["params"]):
-                if p.requires_grad and p.numel() > 0:
+                # NOTE: in Megatron's MixedPrecisionOptimizer/DistributedOptimizer,
+                # the params exposed via param_groups are master fp32 tensors that
+                # the inner torch optimizer steps on. They typically have
+                # requires_grad=False (no autograd needed), so we no longer filter
+                # on requires_grad here.
+                if p.numel() > 0:
                     snapshots.append((p, p.detach().abs().clone()))
                     if identity_probe and p_i < 3:  # first few per group only, to limit log spam
                         s = float(p.detach().sum().item())
                         _LOG.info(
                             "[CWD-probe] g%d.p%d id=%d ptr=0x%x dtype=%s shape=%s "
-                            "device=%s sum=%.6e",
+                            "device=%s requires_grad=%s sum=%.6e",
                             group_i, p_i, id(p), p.data_ptr(), p.dtype,
-                            tuple(p.shape), p.device, s,
+                            tuple(p.shape), p.device, p.requires_grad, s,
                         )
                         pre_fingerprints.append((id(p), p.data_ptr(), s))
 
@@ -181,7 +186,7 @@ def _maybe_wrap_with_cautious_wd(
                 for p_i, p in enumerate(group["params"]):
                     if p_i >= 3:
                         break
-                    if not (p.requires_grad and p.numel() > 0):
+                    if p.numel() == 0:
                         continue
                     new_s = float(p.detach().sum().item())
                     # find the matching pre-fingerprint by id
