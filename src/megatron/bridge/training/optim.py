@@ -130,6 +130,9 @@ def _maybe_wrap_with_cautious_wd(
 
     _LOG.info("Cautious Weight Decay wrapper enabled with factor=%s", factor)
 
+    debug_log_every = int(os.environ.get("BUCKET_A_CAUTIOUS_WD_LOG_EVERY", "0"))
+    apply_cwd = os.environ.get("BUCKET_A_CAUTIOUS_WD_APPLY", "1") != "0"
+
     original_step = optimizer.step
     propagate_method = None
     for name in ("_copy_main_params_to_model_params", "reload_model_params"):
@@ -137,7 +140,13 @@ def _maybe_wrap_with_cautious_wd(
             propagate_method = name
             break
 
+    state = {"step": 0}
+
     def cautious_step(*args, **kwargs):
+        state["step"] += 1
+        step_idx = state["step"]
+        log_this_step = debug_log_every > 0 and step_idx % debug_log_every == 0
+
         snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         for group in optimizer.param_groups:
             for p in group["params"]:
@@ -148,13 +157,39 @@ def _maybe_wrap_with_cautious_wd(
 
         lr = float(optimizer.param_groups[0].get("lr", 0.0))
         coef = -lr * factor
-        if coef != 0.0:
+        cwd_applied = False
+
+        if apply_cwd and coef != 0.0:
             with torch.no_grad():
+                if log_this_step:
+                    total_elems = 0
+                    grew_elems = 0
+                    pre_l1 = 0.0
+                    delta_l1 = 0.0
                 for p, prev_abs in snapshots:
-                    mask = (p.detach().abs() > prev_abs).to(p.dtype)
+                    new_abs = p.detach().abs()
+                    mask = (new_abs > prev_abs).to(p.dtype)
+                    if log_this_step:
+                        total_elems += p.numel()
+                        grew_elems += int(mask.sum().item())
+                        pre_l1 += float(p.detach().abs().sum().item())
+                        delta_l1 += float((mask * p.data).abs().sum().item()) * abs(coef)
                     p.data.addcmul_(mask, p.data, value=coef)
+                cwd_applied = True
             if propagate_method is not None:
                 getattr(optimizer, propagate_method)()
+
+        if log_this_step:
+            grew_frac = grew_elems / max(total_elems, 1) if cwd_applied else float("nan")
+            _LOG.info(
+                "[CWD] step=%d lr=%.3e factor=%s applied=%s grew_frac=%.3f "
+                "sum|p|=%.2e shrinkage_l1=%.2e (≈%.4f%% of |p|)",
+                step_idx, lr, factor, cwd_applied,
+                grew_frac if cwd_applied else float("nan"),
+                pre_l1 if cwd_applied else float("nan"),
+                delta_l1 if cwd_applied else 0.0,
+                100.0 * delta_l1 / max(pre_l1, 1e-12) if cwd_applied else 0.0,
+            )
 
         return result
 
