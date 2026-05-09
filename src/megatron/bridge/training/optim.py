@@ -161,6 +161,12 @@ def _maybe_wrap_with_cautious_wd(
                     group_i, len(group["params"]), group.get("lr"), group.get("weight_decay"),
                     sorted(group.keys()),
                 )
+            # Standard convention everywhere weight decay is used: only apply
+            # to params whose group has weight_decay > 0. This excludes
+            # LayerNorm gamma + biases (Megatron puts these in a wd=0 group).
+            # CWD without this guard collapses LayerNorm scale and tanks training.
+            if group.get("weight_decay", 0.0) <= 0:
+                continue
             for p_i, p in enumerate(group["params"]):
                 # NOTE: in Megatron's MixedPrecisionOptimizer/DistributedOptimizer,
                 # the params exposed via param_groups are master fp32 tensors that
