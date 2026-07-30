@@ -305,7 +305,10 @@ class MultiLoRALinear(AdapterWrapper):
         if destination is None:
             destination = {}
         self.to_wrap.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
-        self.adapters.state_dict(destination=destination, prefix=f"{prefix}adapters.", keep_vars=keep_vars)
+        # hide_adapters() pops the submodule during base-checkpoint loading;
+        # emit base-only state while hidden instead of raising.
+        if (adapters := getattr(self, "adapters", None)) is not None:
+            adapters.state_dict(destination=destination, prefix=f"{prefix}adapters.", keep_vars=keep_vars)
         return destination
 
     def sharded_state_dict(
@@ -316,7 +319,7 @@ class MultiLoRALinear(AdapterWrapper):
     ) -> Dict[str, Any]:
         sharded_sd: Dict[str, Any] = {}
         sharded_sd.update(self.to_wrap.sharded_state_dict(prefix, sharded_offsets, metadata))
-        for i, adapter in enumerate(self.adapters):
+        for i, adapter in enumerate(getattr(self, "adapters", None) or []):
             sharded_sd.update(adapter.sharded_state_dict(f"{prefix}adapters.{i}.", sharded_offsets, metadata))
         return sharded_sd
 
