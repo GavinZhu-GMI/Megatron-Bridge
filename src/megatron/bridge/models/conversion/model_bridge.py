@@ -1040,7 +1040,14 @@ class MegatronModelBridge(
             captured_state_dicts = {f"model{i}": {} for i in range(len(megatron_model))}
         self.unquantized_state_dict = None
 
+        # A grouped HF tensor (all experts of a layer) feeds several tasks; it is loaded once and
+        # dropped after this rank's last task that reads it, so at most one layer's is held.
         _hf_import_cache: Dict[str, torch.Tensor] = {}
+        _hf_import_uses: Dict[str, int] = {}
+        for task in hf_to_megatron_tasks:
+            if task.megatron_module is not None and getattr(task.mapping, "is_grouped_export", False):
+                key = str(task.mapping.hf_param)
+                _hf_import_uses[key] = _hf_import_uses.get(key, 0) + 1
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
             # None means megatron module not on current rank, skip if this task is not going to happen
             if task.megatron_module is None:
@@ -1057,6 +1064,11 @@ class MegatronModelBridge(
 
             # 2) Delegate conversion & distribution to the bridge
             converted_weights = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+            if is_grouped:
+                _hf_import_uses[hf_param_key] -= 1
+                if _hf_import_uses[hf_param_key] == 0:
+                    del _hf_import_cache[hf_param_key]
+            del hf_weights
 
             # 3) Copy into Megatron param if this rank received a shard
             if converted_weights is not None:
