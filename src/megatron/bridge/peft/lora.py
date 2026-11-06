@@ -100,6 +100,12 @@ class LoRA(PEFT, ModuleMatcher):
             SGLang's ``experts_shared_outer_loras=True`` serving contract (PR
             #21466). Default False preserves the adapter layout selected by
             ``share_expert_adapters``.
+        experts_shared_outer_separate_gate_up (bool): With
+            ``experts_shared_outer_loras``, the fused ``gate_up`` fc1 gets two
+            adapters of rank ``dim``, gate and up, each with its own shared
+            hidden-side factor (stored block-diagonally; see
+            :class:`SharedOuterGroupedExpertAdapter`). Default False keeps one
+            adapter over the fused output.
     """
 
     target_modules: List[str] = field(
@@ -116,6 +122,7 @@ class LoRA(PEFT, ModuleMatcher):
     normalize_moe_lora: bool = False
     share_expert_adapters: bool = True
     experts_shared_outer_loras: bool = False
+    experts_shared_outer_separate_gate_up: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
@@ -129,6 +136,10 @@ class LoRA(PEFT, ModuleMatcher):
         Returns:
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
+        # checked here, not in __post_init__: recipes set PEFT fields after construction
+        if self.experts_shared_outer_separate_gate_up and not self.experts_shared_outer_loras:
+            raise ValueError("experts_shared_outer_separate_gate_up requires experts_shared_outer_loras=True")
+
         # Skip already transformed modules
         adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter, TELinearAdapter)
         if isinstance(module, adapter_types):
@@ -215,6 +226,8 @@ class LoRA(PEFT, ModuleMatcher):
                     params_device=first_param.device,
                     params_dtype=first_param.dtype,
                 )
+                if use_shared_outer_adapter and not attrs.input_is_parallel:
+                    adapter_kwargs["separate_gate_up"] = self.experts_shared_outer_separate_gate_up
             else:
                 adapter_kwargs.update(
                     is_expert=is_expert,

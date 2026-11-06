@@ -2213,14 +2213,19 @@ class PackedPerExpertLinear(nn.Module):
         # axis is naturally distinct here (different experts on each EP rank).
         setattr(self.weight, "allreduce", False)
 
+    @staticmethod
+    def grouped_mm_offsets(m_splits, device: torch.device) -> torch.Tensor:
+        """Inclusive ``torch._grouped_mm`` offsets from per-expert token counts."""
+        if isinstance(m_splits, torch.Tensor):
+            m_splits_i32 = m_splits.to(device=device, dtype=torch.int32)
+        else:
+            m_splits_i32 = torch.tensor(m_splits, device=device, dtype=torch.int32)
+        return torch.cumsum(m_splits_i32, dim=0, dtype=torch.int32)
+
     def forward(self, x: torch.Tensor, m_splits) -> Tuple[torch.Tensor, None]:
         # torch._grouped_mm expects mat2 as [num_groups, K, N]; our weight is
         # [N_local, out, in] so transpose the last two dims.
-        if isinstance(m_splits, torch.Tensor):
-            m_splits_i32 = m_splits.to(device=x.device, dtype=torch.int32)
-        else:
-            m_splits_i32 = torch.tensor(m_splits, device=x.device, dtype=torch.int32)
-        offs = torch.cumsum(m_splits_i32, dim=0, dtype=torch.int32)
+        offs = self.grouped_mm_offsets(m_splits, x.device)
         out = torch._grouped_mm(x, self.weight.transpose(1, 2), offs=offs)
         return out, None
 
@@ -2257,6 +2262,21 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
     Bridge's adapter-export materializer (which reads ``linear_in.weight`` /
     ``linear_out.weight``) sees a standard single-weight linear per side.
 
+    With ``separate_gate_up=True`` the fc1 adapter is two adapters of rank
+    ``dim``, one for the gate half and one for the up half of the fused output,
+    each with its own shared hidden-side factor:
+
+        delta_gate[e] = B_gate[e] @ A_gate      delta_up[e] = B_up[e] @ A_up
+
+    They are stored as one adapter of width ``2 * dim``: the shared side is
+    ``[A_gate; A_up]`` and each expert's side is block-diagonal
+    ``[[B_gate[e], 0], [0, B_up[e]]]``. The forward reads only the diagonal
+    blocks, so the off-diagonal ones start at zero, receive zero gradient and
+    stay zero; ``B @ A`` (merge and export) is then exactly
+    ``[delta_gate; delta_up]``. ``self.dim`` stays ``dim``, so both the forward
+    and the merge scale by ``alpha / dim``. Requires expert TP of 1, where the
+    fused fc1 output is ``[gate | up]``.
+
     Differs from ``ParallelLinearAdapter`` in ``__init__`` and ``forward``;
     ``sharded_state_dict`` is specialized for the packed 3D per-expert side.
     """
@@ -2280,6 +2300,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         base_linear_is_parallel: bool = True,
         params_device: Optional[torch.device] = None,
         params_dtype: Optional[torch.dtype] = None,
+        separate_gate_up: bool = False,
     ) -> None:
         """Initialize shared-outer LoRA weights with one shared and one per-expert side."""
 
@@ -2308,11 +2329,24 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
 
         column_init = ParallelLinearAdapter._get_init_fn(self, column_init_method)
         row_init = ParallelLinearAdapter._get_init_fn(self, row_init_method)
+        self.separate_gate_up = separate_gate_up
+        if separate_gate_up:
+            if not self._is_fc1:
+                raise ValueError("separate_gate_up applies to the fused gate/up fc1 only")
+            if model_parallel_config.expert_tensor_parallel_size != 1:
+                raise ValueError(
+                    "separate_gate_up needs expert_tensor_parallel_size=1, got "
+                    f"{model_parallel_config.expert_tensor_parallel_size}"
+                )
+            if out_features % 2 != 0:
+                raise ValueError(f"fused gate/up out_features must be even, got {out_features}")
+        # fc1 width: one rank-`dim` factor per half when gate and up are separate
+        fc1_width = 2 * dim if separate_gate_up else dim
         if self._is_fc1:
             # Shared A (hidden → rank); per-expert B (rank → 2*intermediate).
             self.linear_in = ColumnParallelLinear(
                 in_features,
-                dim,
+                fc1_width,
                 config=model_parallel_config,
                 bias=False,
                 gather_output=True,
@@ -2321,12 +2355,18 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
             )
             self.linear_out = PackedPerExpertLinear(
                 num_local_experts,
-                dim,
+                fc1_width,
                 out_features,
                 init_method=row_init,
                 device=params_device,
                 dtype=params_dtype,
             )
+            if separate_gate_up:
+                # the off-diagonal blocks are never read by the forward: hold them at zero
+                half = out_features // 2
+                with torch.no_grad():
+                    self.linear_out.weight[:, :half, dim:].zero_()
+                    self.linear_out.weight[:, half:, :dim].zero_()
         else:
             # Per-expert A (intermediate → rank); shared B (rank → hidden).
             self.linear_in = PackedPerExpertLinear(
@@ -2367,7 +2407,17 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
         if self.dropout_position == "pre":
             x = self.dropout(x)
 
-        if self._is_fc1:
+        if self._is_fc1 and self.separate_gate_up:
+            # Shared [A_gate; A_up] → activation → each half's per-expert B on its own rank slice.
+            x, _ = self.linear_in(x)
+            x = self.activation(x)
+            weight = self.linear_out.weight
+            half = weight.shape[1] // 2
+            offs = PackedPerExpertLinear.grouped_mm_offsets(m_splits, x.device)
+            gate = torch._grouped_mm(x[..., : self.dim], weight[:, :half, : self.dim].transpose(1, 2), offs=offs)
+            up = torch._grouped_mm(x[..., self.dim :], weight[:, half:, self.dim :].transpose(1, 2), offs=offs)
+            x = torch.cat([gate, up], dim=-1)
+        elif self._is_fc1:
             # Shared A → activation → per-expert B.
             x, _ = self.linear_in(x)
             x = self.activation(x)

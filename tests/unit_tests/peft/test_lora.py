@@ -336,6 +336,39 @@ class TestLoRA:
         assert adapted.adapter.linear_in.weight.shape == torch.Size([2, 32, 2048])
         assert adapted.adapter.linear_out.weight.shape == torch.Size([2, 512, 32])
 
+    def test_lora_shared_outer_separate_gate_up_reaches_fc1_only(self):
+        """experts_shared_outer_separate_gate_up is passed to the fused gate/up fc1 adapter, not to fc2."""
+        model = GroupedExpertModel()
+        fc1 = MockMegatronLinear(512, 4096)
+        fc1.num_gemms = 2
+        model.decoder.layers[0].mlp.experts.linear_fc1 = fc1
+        lora = LoRA(
+            target_modules=["linear_fc1", "linear_fc2"],
+            experts_shared_outer_loras=True,
+            experts_shared_outer_separate_gate_up=True,
+        )
+
+        def mock_get_attrs(module, is_expert=False):
+            return AdapterAttributes(
+                input_is_parallel=module is not fc1,  # fc1 is column-parallel, fc2 row-parallel
+                in_features=module.in_features,
+                out_features=module.out_features,
+                disable_tensor_parallel_comm=False,
+                disable_sequence_parallel_comm=True,
+                base_linear_is_parallel=True,
+            )
+
+        with (
+            patch("megatron.bridge.peft.lora.get_adapter_attributes_from_linear", side_effect=mock_get_attrs),
+            patch("megatron.bridge.peft.lora.SharedOuterGroupedExpertAdapter") as adapter_cls,
+        ):
+            lora(model, training=True)
+
+        kwargs = {call.kwargs["base_linear_name"]: call.kwargs for call in adapter_cls.call_args_list}
+        assert kwargs["decoder.layers.0.mlp.experts.linear_fc1"]["separate_gate_up"] is True
+        assert "separate_gate_up" not in kwargs["decoder.layers.0.mlp.experts.linear_fc2"]
+        assert "is_expert" not in kwargs["decoder.layers.0.mlp.experts.linear_fc1"]
+
     def test_lora_wildcard_matching(self):
         """Test LoRA transformation with wildcard patterns."""
         model = NestedModel()
