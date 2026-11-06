@@ -43,16 +43,22 @@ SPLITS = [5, 0, 7]  # tokens per expert, one expert empty
 
 @pytest.fixture(autouse=True, scope="module")
 def model_parallel():
-    if not dist.is_initialized():
+    # tear down only what this module set up: later modules must find the state they left
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29511")
         torch.cuda.set_device(0)
         dist.init_process_group(backend="nccl", world_size=1, rank=0, timeout=datetime.timedelta(minutes=5))
-    if not parallel_state.model_parallel_is_initialized():
+    owns_model_parallel = not parallel_state.model_parallel_is_initialized()
+    if owns_model_parallel:
         parallel_state.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     model_parallel_cuda_manual_seed(1234)  # expert linears init under the expert-parallel RNG
     yield
-    parallel_state.destroy_model_parallel()
+    if owns_model_parallel:
+        parallel_state.destroy_model_parallel()
+    if owns_process_group:
+        dist.destroy_process_group()
 
 
 def _fc1(**overrides) -> SharedOuterGroupedExpertAdapter:
