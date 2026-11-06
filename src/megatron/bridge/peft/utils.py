@@ -2275,7 +2275,8 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
     stay zero; ``B @ A`` (merge and export) is then exactly
     ``[delta_gate; delta_up]``. ``self.dim`` stays ``dim``, so both the forward
     and the merge scale by ``alpha / dim``. Requires expert TP of 1, where the
-    fused fc1 output is ``[gate | up]``.
+    fused fc1 output is ``[gate | up]``: the grouped experts' GLU splits it with
+    ``torch.chunk(x, 2, dim=-1)`` (``megatron.core.transformer.moe.experts``).
 
     Differs from ``ParallelLinearAdapter`` in ``__init__`` and ``forward``;
     ``sharded_state_dict`` is specialized for the packed 3D per-expert side.
