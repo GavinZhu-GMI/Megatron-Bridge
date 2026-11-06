@@ -2274,3 +2274,79 @@ def test_column_parallel_mapping_skips_ep_gather_for_adapters(monkeypatch):
 
     result = mapping.megatron_to_hf(torch.ones(2, 2), None)
     torch.testing.assert_close(result["hf_param"], torch.ones(2, 2))
+
+
+def test_stream_weights_megatron_to_hf_merges_before_a_reordering_grouped_export(monkeypatch):
+    # gpt-oss experts: megatron_to_hf un-interleaves gate/up rows and transposes to (in, out), so the
+    # (out, in) LoRA delta must be added to the Megatron weight before the mapping runs
+    bridge = DummyBridge()
+
+    def reorder(w):
+        gate, up = torch.chunk(w, 2, dim=0)
+        out = torch.empty_like(w)
+        out[::2], out[1::2] = gate, up
+        return out.transpose(0, 1).contiguous()
+
+    class ReorderingMapping:
+        is_grouped_export = True
+        merge_adapter_before_export = True
+        group_key = "hf.experts.gate_up_proj"
+
+        def megatron_to_hf(self, weight, module):
+            return {self.group_key: reorder(weight)}
+
+    base = torch.arange(12.0).reshape(4, 3)  # (out = 2 * intermediate, in)
+    task = WeightConversionTask(
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight0",
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.to_wrap.weight0",
+        mapping=ReorderingMapping(),
+        pp_rank=0,
+        vp_stage=0,
+        megatron_module=None,
+        param_weight=base,
+    )
+    prefix = "decoder.layers.0.mlp.experts.linear_fc1"
+    adapter_task = AdapterWeightConversionTask(
+        global_base_prefix=prefix,
+        adapter_key=None,
+        alpha=1,
+        dim=1,
+        linear_in_task=WeightConversionTask(
+            param_name="local_in", global_param_name=f"{prefix}.adapter.linear_in.weight", mapping=Mock()
+        ),
+        linear_out_task=WeightConversionTask(
+            param_name="local_out", global_param_name=f"{prefix}.adapter.linear_out.weight", mapping=Mock()
+        ),
+    )
+    linear_in = torch.tensor([[1.0, 0.0, 2.0]])
+    linear_out = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+    adapter_weight = AdapterWeight(
+        global_base_prefix=prefix,
+        adapter_key=None,
+        alpha=1,
+        dim=1,
+        linear_in_weight=MegatronWeightTuple("in", linear_in, vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out", linear_out, vp_stage=0),
+    )
+    monkeypatch.setattr(DummyBridge, "_with_progress_tracking", lambda self, tasks, *_a, **_k: tasks)
+    monkeypatch.setattr(DummyBridge, "_share_embeddings_and_output_weights", lambda self, *_a, **_k: False)
+    monkeypatch.setattr(DummyBridge, "build_adapter_conversion_tasks", lambda *_a, **_k: {prefix: [adapter_task]})
+    monkeypatch.setattr(DummyBridge, "materialize_adapter_weights", lambda *_a, **_k: [adapter_weight])
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.model_bridge.unwrap_model",
+        lambda *_a, **_k: [SimpleNamespace(config=SimpleNamespace(num_moe_experts=1))],
+    )
+
+    weights = list(
+        bridge.stream_weights_megatron_to_hf(
+            [Mock()],
+            SimpleNamespace(),
+            cpu=False,
+            show_progress=False,
+            conversion_tasks=[task],
+            merge_adapter_weights=True,
+        )
+    )
+
+    assert len(weights) == 1
+    torch.testing.assert_close(weights[0].weight, reorder(base + linear_out @ linear_in).unsqueeze(0))

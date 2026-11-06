@@ -1293,7 +1293,6 @@ class MegatronModelBridge(
                 megatron_weights = None
                 megatron_module = None
 
-            converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
             adapter_tasks = None
             task_global_base_prefix = None
             if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
@@ -1302,11 +1301,21 @@ class MegatronModelBridge(
 
             # --- Grouped export path: accumulate per-expert weights, yield when complete ---
             if getattr(task.mapping, "is_grouped_export", False):
+                adapter_weights = None
                 if merge_adapter_weights and adapter_tasks:
                     adapter_weights = materialized_adapter_weights_cache.get(task_global_base_prefix)
                     if adapter_weights is None:
                         adapter_weights = self.materialize_adapter_weights(adapter_tasks)
                         materialized_adapter_weights_cache[task_global_base_prefix] = adapter_weights
+                # A mapping whose megatron_to_hf reorders the weight (transpose, gate/up
+                # interleave) merges the (out, in) LoRA delta into the Megatron weight first.
+                merge_first = getattr(task.mapping, "merge_adapter_before_export", False)
+                if adapter_weights is not None and merge_first and megatron_weights is not None:
+                    megatron_weights = self._merge_grouped_export_adapter_weights(
+                        task, {"megatron": megatron_weights}, adapter_weights, model_config.num_moe_experts
+                    )["megatron"]
+                converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
+                if adapter_weights is not None and not merge_first:
                     converted_weights_dict = self._merge_grouped_export_adapter_weights(
                         task,
                         converted_weights_dict,
@@ -1322,6 +1331,7 @@ class MegatronModelBridge(
                 continue
 
             # --- Standard export path ---
+            converted_weights_dict = task.mapping.megatron_to_hf(megatron_weights, megatron_module)
             converted_weights_dict = self.maybe_modify_converted_hf_weight(
                 task,
                 converted_weights_dict,

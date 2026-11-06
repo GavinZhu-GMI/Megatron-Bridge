@@ -237,6 +237,7 @@ class GPTOSSMLPDownProjMapping(AutoMapping):
     """MLPDownProj for expert weights in GPT-OSS models."""
 
     is_grouped_export = True
+    merge_adapter_before_export = True  # megatron_to_hf transposes
 
     def __init__(self, megatron_param: str, hf_param: str, permute_dims: Optional[Tuple[int, ...]] = None):
         super().__init__(megatron_param, hf_param, permute_dims)
@@ -272,6 +273,7 @@ class GPTOSSMLPGateUpProjMapping(AutoMapping):
     """
 
     is_grouped_export = True
+    merge_adapter_before_export = True  # megatron_to_hf un-interleaves gate/up and transposes
 
     def __init__(self, megatron_param: str, hf_param: str, permute_dims: Optional[Tuple[int, ...]] = None):
         super().__init__(megatron_param, hf_param, permute_dims)
