@@ -559,3 +559,32 @@ class TestStateDictCachingAndOptimization:
         # Verify we can get keys
         keys = list(state_dict.keys())
         assert len(keys) == 2
+
+
+class TestSafeTensorsResolvePath:
+    def test_hub_download_fetches_only_the_root_checkpoint(self, tmp_path):
+        # gpt-oss ships a second full checkpoint under original/; the bridge reads only the
+        # root shards through model.safetensors.index.json
+        from huggingface_hub.utils import filter_repo_objects
+
+        repo = [
+            "config.json",
+            "model.safetensors.index.json",
+            "model-00000-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+            "original/model--00001-of-00007.safetensors",
+            "metal/model.bin",
+        ]
+        with patch("huggingface_hub.snapshot_download", return_value=str(tmp_path)) as download:
+            assert SafeTensorsStateSource._resolve_path("org/model") == tmp_path
+        kwargs = download.call_args.kwargs
+        fetched = list(
+            filter_repo_objects(
+                repo, allow_patterns=kwargs["allow_patterns"], ignore_patterns=kwargs["ignore_patterns"]
+            )
+        )
+        assert fetched == [
+            "model.safetensors.index.json",
+            "model-00000-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+        ]

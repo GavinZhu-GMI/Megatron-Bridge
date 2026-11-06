@@ -558,8 +558,10 @@ class SafeTensorsStateSource(StateSource):
                         "*.safetensors",
                         "model.safetensors.index.json",
                     ],
-                    # Ignore other large files.
-                    ignore_patterns=["*.bin", "*.pt", "*.pth"],
+                    # Ignore other large files, and every subfolder: fnmatch's "*" spans
+                    # "/", so "*.safetensors" alone also fetches e.g. gpt-oss's original/
+                    # checkpoint, a second full copy of the weights in another format.
+                    ignore_patterns=["*.bin", "*.pt", "*.pth", "*/*"],
                 )
             )
         except (ImportError, HfHubHTTPError, ValueError) as e:
