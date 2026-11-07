@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.utils import unwrap_model
 
 from megatron.bridge.peft.base import PEFT
+from megatron.bridge.peft.canonical_lora import LoRALinearSplitQKV, ModuleDict
 from megatron.bridge.peft.lora_layers import (
     LinearAdapter,
     LoRALinear,
@@ -106,6 +107,12 @@ class LoRA(PEFT, ModuleMatcher):
             hidden-side factor (stored block-diagonally; see
             :class:`SharedOuterGroupedExpertAdapter`). Default False keeps one
             adapter over the fused output.
+        split_qkv_adapters (bool): When True, the fused ``linear_qkv`` gets three
+            separate adapters of rank ``dim`` (q, k, v), built as
+            :class:`~megatron.bridge.peft.canonical_lora.CanonicalLoRA` builds them
+            (:class:`~megatron.bridge.peft.canonical_lora.LoRALinearSplitQKV`). Other
+            targets keep this class's layout, so it combines with the expert
+            adapter options above. Default False keeps one adapter over the fused output.
     """
 
     target_modules: List[str] = field(
@@ -123,6 +130,7 @@ class LoRA(PEFT, ModuleMatcher):
     share_expert_adapters: bool = True
     experts_shared_outer_loras: bool = False
     experts_shared_outer_separate_gate_up: bool = False
+    split_qkv_adapters: bool = False
 
     def transform(self, module: nn.Module, name: Optional[str] = None, prefix: Optional[str] = None) -> nn.Module:
         """
@@ -141,7 +149,7 @@ class LoRA(PEFT, ModuleMatcher):
             raise ValueError("experts_shared_outer_separate_gate_up requires experts_shared_outer_loras=True")
 
         # Skip already transformed modules
-        adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter, TELinearAdapter)
+        adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter, TELinearAdapter, LoRALinearSplitQKV)
         if isinstance(module, adapter_types):
             return module
 
@@ -235,6 +243,18 @@ class LoRA(PEFT, ModuleMatcher):
                     disable_tensor_parallel_comm=attrs.disable_tensor_parallel_comm,
                     disable_sequence_parallel_comm=attrs.disable_sequence_parallel_comm,
                 )
+            if self.split_qkv_adapters and name == "linear_qkv":
+                # CanonicalLoRA's split form, same output sizes and wrapper
+                q_out_features = module.config.kv_channels * module.config.num_attention_heads
+                kv_out_features = module.config.kv_channels * module.config.num_query_groups
+                adapters = ModuleDict(
+                    {
+                        "adapter_q": adapter_cls(attrs.in_features, q_out_features, dim, **adapter_kwargs),
+                        "adapter_k": adapter_cls(attrs.in_features, kv_out_features, dim, **adapter_kwargs),
+                        "adapter_v": adapter_cls(attrs.in_features, kv_out_features, dim, **adapter_kwargs),
+                    }
+                )
+                return LoRALinearSplitQKV(module, adapters)
             adapter = adapter_cls(attrs.in_features, attrs.out_features, dim, **adapter_kwargs)
             if isinstance(module, TopKRouter):
                 return LoRATopKRouter(module, adapter)
