@@ -2192,6 +2192,7 @@ class PackedPerExpertLinear(nn.Module):
         in_features: int,
         out_features: int,
         *,
+        pg_collection: ProcessGroupCollection,
         init_method: Optional[Callable] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
@@ -2200,6 +2201,8 @@ class PackedPerExpertLinear(nn.Module):
         if not hasattr(torch, "_grouped_mm"):
             raise RuntimeError("PackedPerExpertLinear requires torch._grouped_mm (torch >= 2.9).")
         self.num_local_experts = num_local_experts
+        # the EP / expert-DP groups that place this rank's experts in a checkpoint
+        self.pg_collection = pg_collection
         self.in_features = in_features
         self.out_features = out_features
         weight = torch.empty(num_local_experts, out_features, in_features, dtype=dtype, device=device)
@@ -2236,7 +2239,11 @@ class PackedPerExpertLinear(nn.Module):
         key = f"{prefix}weight"
         return {
             key: _make_grouped_expert_sharded_tensor(
-                self.weight.data, key, tp_axis=None, sharded_offsets=sharded_offsets
+                self.weight.data,
+                key,
+                tp_axis=None,
+                sharded_offsets=sharded_offsets,
+                pg_collection=self.pg_collection,
             )
         }
 
@@ -2322,6 +2329,10 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
             model_parallel_config = ModelParallelConfig()
         model_parallel_config.perform_initialization = True
         self.config = model_parallel_config
+        # resolved as GroupedExpertLinearAdapter does; the per-expert side shards on it
+        self.pg_collection = _get_pg_collection(
+            None, model_parallel_config, required_pgs=["ep", "expt_tp", "expt_dp"]
+        )
 
         # ``input_is_parallel`` selects fc1 (column-parallel base) vs fc2
         # (row-parallel base). Mirrors :class:`ParallelLinearAdapter` and
@@ -2358,6 +2369,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 num_local_experts,
                 fc1_width,
                 out_features,
+                pg_collection=self.pg_collection,
                 init_method=row_init,
                 device=params_device,
                 dtype=params_dtype,
@@ -2374,6 +2386,7 @@ class SharedOuterGroupedExpertAdapter(nn.Module):
                 num_local_experts,
                 in_features,
                 dim,
+                pg_collection=self.pg_collection,
                 init_method=column_init,
                 device=params_device,
                 dtype=params_dtype,

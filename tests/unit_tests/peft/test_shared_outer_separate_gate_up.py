@@ -154,3 +154,36 @@ def test_lora_refuses_the_split_without_shared_outer():
     lora = LoRA(experts_shared_outer_separate_gate_up=True)
     with pytest.raises(ValueError, match="requires experts_shared_outer_loras"):
         lora.transform(nn.Linear(4, 4), name="linear_fc1", prefix="decoder.layers.0.mlp.experts")
+
+
+@pytest.mark.parametrize("fc", ["fc1", "fc2"])
+def test_sharded_state_dict_places_the_per_expert_side_by_expert_parallel_rank(fc):
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+
+    if fc == "fc1":
+        adapter, per_expert = _fc1(), "linear_out.weight"
+    else:
+        adapter = SharedOuterGroupedExpertAdapter(
+            INTER,
+            H,
+            R,
+            num_local_experts=E,
+            base_linear_name="decoder.layers.0.mlp.experts.linear_fc2",
+            activation="identity",
+            input_is_parallel=True,
+            model_parallel_config=ModelParallelConfig(bf16=True, params_dtype=torch.bfloat16),
+            alpha=ALPHA,
+            params_device=torch.device("cuda"),
+            params_dtype=torch.bfloat16,
+        ).cuda()
+        per_expert = "linear_in.weight"
+    # the per-expert side resolves its EP / expert-DP placement from the adapter's process groups
+    entry = adapter.sharded_state_dict(
+        prefix="adapter.",
+        # the checkpoint caller's metadata (training/checkpointing.py)
+        metadata={"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)},
+    )[f"adapter.{per_expert}"]
+    # fc1's per-expert side is wrapped in the SwiGLU factory, fc2's is a plain sharded tensor
+    assert isinstance(entry, ShardedTensorFactory if fc == "fc1" else ShardedTensor)
+    assert entry.key == f"adapter.{per_expert}"
+    assert entry.data.data_ptr() == getattr(adapter, per_expert.split(".")[0]).weight.data_ptr()
