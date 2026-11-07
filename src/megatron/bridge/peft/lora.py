@@ -144,7 +144,7 @@ class LoRA(PEFT, ModuleMatcher):
         Returns:
             nn.Module: The modified module with LoRA applied, or the original module if not a target.
         """
-        # checked here, not in __post_init__: recipes set PEFT fields after construction
+        # checked at transform time, so a field set after construction is checked too
         if self.experts_shared_outer_separate_gate_up and not self.experts_shared_outer_loras:
             raise ValueError("experts_shared_outer_separate_gate_up requires experts_shared_outer_loras=True")
 

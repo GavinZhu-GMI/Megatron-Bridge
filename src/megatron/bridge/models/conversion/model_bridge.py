@@ -1309,6 +1309,7 @@ class MegatronModelBridge(
                         materialized_adapter_weights_cache[task_global_base_prefix] = adapter_weights
                 # A mapping whose megatron_to_hf reorders the weight (transpose, gate/up
                 # interleave) merges the (out, in) LoRA delta into the Megatron weight first.
+                # an optional flag on the duck-typed mapping protocol, read as is_grouped_export is
                 merge_first = getattr(task.mapping, "merge_adapter_before_export", False)
                 if adapter_weights is not None and merge_first and megatron_weights is not None:
                     megatron_weights = self._merge_grouped_export_adapter_weights(
